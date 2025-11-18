@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
-use std::io::{BufRead, BufReader,  Cursor};
+use std::io::{BufRead, BufReader, Cursor};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use ctrlc;
 
 const MIN_CLIENT_BYTES: u64 = 500;
 const MAX_SERVER_BYTES: u64 = 200;
@@ -31,7 +34,6 @@ fn parse_ipv4(s: &str) -> Option<u32> {
 }
 
 fn parse_conntrack_output(line: &str) -> Option<(u32, u64, u64)> {
-    // conntrack -L: ipv4 2 tcp 6 117 ESTABLISHED src=192.168.1.1 dst=8.8.8.8 sport=443 dport=443 packets=10 bytes=5000 [ASSURED]
     if !line.contains("dport=443") || !line.contains("tcp") {
         return None;
     }
@@ -94,46 +96,55 @@ fn add_ips_to_nft(table_name: &str, new_ips: &[String]) -> Result<(), Box<dyn Er
         .args(&["add", "element", "inet", "fw4", table_name, &nft_arg])
         .status()?;
 
-    match status.success() {
-        true => eprintln!(
+    if status.success() {
+        eprintln!(
             "added {} IPs to nft set {}: {}",
             new_ips.len(),
             table_name,
             elements
-        ),
-        false => eprintln!("failed to add IPs to nft set {}: {}", table_name, elements),
+        );
+    } else {
+        eprintln!(
+            "failed to add IPs to nft set {}: {}",
+            table_name,
+            elements
+        );
     }
 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let table_name = env::args()
-        .nth(1)
-        .ok_or("usage: nf_conntrack_hello <nft_set_name>")?;
-
-    eprintln!(
-        "nf_conntrack_hello (conntrack binary mode, MIN_C2S={}B, MAX_S2C={}B, nft set={})",
-        MIN_CLIENT_BYTES, MAX_SERVER_BYTES, table_name
-    );
-
-    let mut reported_ips: HashSet<u32> = HashSet::new();
-
-    loop {
-        let mut new_ips = Vec::new();
-
-        for (ip_str, bytes_c2s, bytes_s2c) in conntrack_stream(&mut reported_ips)? {
-            println!(
-                "{} (c2s={}B s2c={}B) -> queued for nft set {}",
-                ip_str, bytes_c2s, bytes_s2c, table_name
-            );
-            new_ips.push(ip_str);
-        }
-
-        add_ips_to_nft(&table_name, &new_ips)?;
-
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+fn remove_ips_from_nft(
+    table_name: &str,
+    ips: &HashSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    if ips.is_empty() {
+        return Ok(());
     }
+
+    let elements = ips.iter().cloned().collect::<Vec<_>>().join(", ");
+    let nft_arg = format!("{{ {} }}", elements);
+
+    let status = Command::new("nft")
+        .args(&["delete", "element", "inet", "fw4", table_name, &nft_arg])
+        .status()?;
+
+    if status.success() {
+        eprintln!(
+            "removed {} IPs from nft set {}: {}",
+            ips.len(),
+            table_name,
+            elements
+        );
+    } else {
+        eprintln!(
+            "failed to remove IPs from nft set {}: {}",
+            table_name,
+            elements
+        );
+    }
+
+    Ok(())
 }
 
 fn conntrack_stream<'a>(
@@ -159,4 +170,60 @@ fn conntrack_stream<'a>(
                 process_conntrack_line(&line_str, reported_ips)
             }),
     )
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let table_name = env::args()
+        .nth(1)
+        .ok_or("usage: nf_conntrack_hello <nft_set_name>")?;
+
+    eprintln!(
+        "nf_conntrack_hello (conntrack binary mode, MIN_C2S={}B, MAX_S2C={}B, nft set={})",
+        MIN_CLIENT_BYTES, MAX_SERVER_BYTES, table_name
+    );
+
+    let mut reported_ips: HashSet<u32> = HashSet::new();
+    let all_added_ips: Arc<Mutex<HashSet<String>>> =
+        Arc::new(Mutex::new(HashSet::new()));
+
+    // данные для хендлера Ctrl+C
+    let handler_table = table_name.clone();
+    let handler_ips = Arc::clone(&all_added_ips);
+
+    ctrlc::set_handler(move || {
+        eprintln!("ctrl+C detected, cleaning up nft set…");
+
+        let ips_guard = handler_ips.lock().unwrap();
+        if let Err(e) = remove_ips_from_nft(&handler_table, &*ips_guard) {
+            eprintln!("cleanup failed: {e}");
+        }
+
+        eprintln!("cleanup done, exiting");
+        std::process::exit(0);
+    })?;
+
+    loop {
+        let mut new_ips = Vec::new();
+
+        if let Ok(stream) = conntrack_stream(&mut reported_ips) {
+            for (ip_str, bytes_c2s, bytes_s2c) in stream {
+                println!(
+                    "{} (c2s={}B s2c={}B) -> queued for nft set {}",
+                    ip_str, bytes_c2s, bytes_s2c, table_name
+                );
+                new_ips.push(ip_str);
+            }
+        }
+
+        if !new_ips.is_empty() {
+            add_ips_to_nft(&table_name, &new_ips)?;
+
+            let mut guard = all_added_ips.lock().unwrap();
+            for ip in new_ips {
+                guard.insert(ip);
+            }
+        }
+
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+    }
 }
